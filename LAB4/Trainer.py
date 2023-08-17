@@ -35,26 +35,61 @@ def kl_criterion(mu, logvar, batch_size):
 
 class kl_annealing():
     def __init__(self, args, current_epoch=0):
-        # TODO
-        raise NotImplementedError
+        self.anneal_type = args.kl_anneal_type
+        self.anneal_cycle = args.kl_anneal_cycle
+        self.anneal_ratio = args.kl_anneal_ratio
+        self.current_epoch = -1
+        if self.anneal_type == "Cyclical":
+            self.L = self.frange_cycle_linear(args.num_epoch)
+        elif self.anneal_type == "Monotonic":
+            end_period = False
+            L = self.frange_cycle_linear(args.num_epoch)
+            for i in range(1, args.num_epoch):
+                if end_period:
+                    L[i] = 1.0
+                    continue
+                if L[i] < L[i-1]:
+                    L[i] = 1
+                    end_period = True
+            self.L = L
+        else:
+            self.L = np.ones(args.num_epoch) * self.anneal_ratio
+        self.beta = self.L[0]
+        print("kl_annealing schedule:", self.L)
         
     def update(self):
         # TODO
-        raise NotImplementedError
+        self.current_epoch += 1
+        self.beta = self.L[self.current_epoch]
     
     def get_beta(self):
-        # TODO
-        raise NotImplementedError
+        return self.beta
 
-    def frange_cycle_linear(self, n_iter, start=0.0, stop=1.0,  n_cycle=1, ratio=1):
+    def frange_cycle_linear(self, n_iter, start=0.0, stop=1.0):
         # TODO
-        raise NotImplementedError
+        n_cycle=self.anneal_cycle
+        ratio=self.anneal_ratio
+
+        L = np.ones(n_iter) * stop
+        period = n_iter/n_cycle
+
+        step = (stop - start)/(period * ratio)
+        
+        for c in range(n_cycle):
+            v, i = start, 0
+            while v <= stop and (int(i + c * period) < n_iter):
+                L[int(i + c* period)] = v
+                v += step
+                i += 1
+        return L
+        
         
 
 class VAE_Model(nn.Module):
     def __init__(self, args):
         super(VAE_Model, self).__init__()
         self.args = args
+        self.mode = 1
         
         # Modules to transform image from RGB-domain to feature-domain
         self.frame_transformation = RGB_Encoder(3, args.F_dim)
@@ -68,7 +103,7 @@ class VAE_Model(nn.Module):
         self.Generator            = Generator(input_nc=args.D_out_dim, output_nc=3)
         
         self.optim      = optim.Adam(self.parameters(), lr=self.args.lr)
-        self.scheduler  = optim.lr_scheduler.MultiStepLR(self.optim, milestones=[2, 5], gamma=0.1)
+        self.scheduler  = optim.lr_scheduler.MultiStepLR(self.optim, milestones=[2, 5, 50, 80], gamma=0.1)#[2,5]
         self.kl_annealing = kl_annealing(args, current_epoch=0)
         self.mse_criterion = nn.MSELoss()
         self.current_epoch = 0
@@ -87,15 +122,24 @@ class VAE_Model(nn.Module):
         pass
     
     def training_stage(self):
+        train_loss_plot = []
+        val_loss_plot = []
+        tfr_plot = []
+        PSNR_plot = []
+
         for i in range(self.args.num_epoch):
+            img_count = 0
+            tfr_plot.append(self.tfr)
+            train_loss = 0.0
             train_loader = self.train_dataloader()
-            adapt_TeacherForcing = True if random.random() < self.tfr else False
+            adapt_TeacherForcing = True if random.random() < self.tfr else False #self.tfr > 0 else False #
             
             for (img, label) in (pbar := tqdm(train_loader, ncols=120)):
+                img_count += (img.size(0)*img.size(1))
                 img = img.to(self.args.device)
                 label = label.to(self.args.device)
                 loss = self.training_one_step(img, label, adapt_TeacherForcing)
-                
+                train_loss += loss.detach().cpu() * img.size(0) #not sure
                 beta = self.kl_annealing.get_beta()
                 if adapt_TeacherForcing:
                     self.tqdm_bar('train [TeacherForcing: ON, {:.1f}], beta: {}'.format(self.tfr, beta), pbar, loss.detach().cpu(), lr=self.scheduler.get_last_lr()[0])
@@ -104,30 +148,148 @@ class VAE_Model(nn.Module):
             
             if self.current_epoch % self.args.per_save == 0:
                 self.save(os.path.join(self.args.save_root, f"epoch={self.current_epoch}.ckpt"))
-                
-            self.eval()
+            
+            val_loss, PSNR = self.eval()
+
+            train_loss_plot.append(train_loss/img_count)
+            val_loss_plot.append(val_loss)
+            PSNR_plot.append(PSNR.detach().cpu())
+            
             self.current_epoch += 1
             self.scheduler.step()
             self.teacher_forcing_ratio_update()
             self.kl_annealing.update()
+            self.gen_image(train_loss_plot, val_loss_plot, tfr_plot, PSNR_plot)
             
+    def gen_image(self, train_loss_plot, val_loss_plot, tfr_plot, PSNR_plot, PSNR_frame = False):
+        if PSNR_frame:
+            plt.figure(figsize=(10, 6))
+            plt.plot(train_loss_plot, label='PSNR')
+            plt.xlabel('Frame')
+            plt.ylabel('PSNR')
+            plt.title(f'Validation PSNR ({self.args.kl_anneal_type})')
+            plt.legend()
+            plt.savefig(f'./{self.args.save_root}/{self.args.kl_anneal_type}_PSNR_per_frame.png')
+            plt.close()
+            return
+    
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_loss_plot, marker='o', label='Training Loss')
+        plt.plot(val_loss_plot, marker='o', label='Validation Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.title(f'Loss Curve({self.args.kl_anneal_type})')
+        plt.legend()
+        plt.savefig(f'./{self.args.save_root}/{self.args.kl_anneal_type}_loss.png')
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        plt.semilogy(train_loss_plot, marker='o', label='Training Loss')
+        plt.semilogy(val_loss_plot, marker='o', label='Validation Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.title(f'Log Loss Curve({self.args.kl_anneal_type})')
+        plt.legend()
+        plt.savefig(f'./{self.args.save_root}/{self.args.kl_anneal_type}_logloss.png')
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(tfr_plot, marker = 'o', label = 'tfr')
+        plt.xlabel('Epochs')
+        plt.ylabel('tfr')
+        plt.title(f'Teacher Forcing Rate')
+        plt.legend()
+        plt.savefig(f'./{self.args.save_root}/{self.args.kl_anneal_type}_tfr.png')
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(PSNR_plot, marker = 'o', label = 'Valid PSNR')
+        plt.xlabel('Epochs')
+        plt.ylabel('PSNR')
+        plt.title(f'Validation PSNR')
+        plt.legend()
+        plt.savefig(f'./{self.args.save_root}/{self.args.kl_anneal_type}_PSNR.png')
+        plt.close()
             
     @torch.no_grad()
     def eval(self):
         val_loader = self.val_dataloader()
+        val_loss = 0.0
+        val_PSNR = 0.0
+        img_count = 0
         for (img, label) in (pbar := tqdm(val_loader, ncols=120)):
+            img_count += (img.size(0) * img.size(1))
             img = img.to(self.args.device)
             label = label.to(self.args.device)
-            loss = self.val_one_step(img, label)
+            loss, PSNR = self.val_one_step(img, label)
+            val_loss += loss.detach().cpu()
+            val_PSNR += PSNR
             self.tqdm_bar('val', pbar, loss.detach().cpu(), lr=self.scheduler.get_last_lr()[0])
-    
+        return val_loss/img_count, PSNR/img_count
+
     def training_one_step(self, img, label, adapt_TeacherForcing):
         # TODO
-        raise NotImplementedError
+        img = img.permute(1, 0, 2, 3, 4)
+        label = label.permute(1, 0, 2, 3, 4)
+        out = img[0]
+
+        reconstruction_loss = 0.0
+        kl_loss = 0.0
+        for i in range(1, self.train_vi_len):
+            label_feat = self.label_transformation(label[i])
+            if self.mode == 1:
+                out = img[i-1] * self.tfr + out * (1 - self.tfr)
+            elif adapt_TeacherForcing:
+                out = img[i-1]
+            human_feat_hat = self.frame_transformation(out)
+            
+            z, mu, logvar = self.Gaussian_Predictor(human_feat_hat, label_feat)
+            
+            parm = self.Decoder_Fusion(human_feat_hat, label_feat, z)
+            out = self.Generator(parm)
+
+            reconstruction_loss += self.mse_criterion(out, img[i])
+            kl_loss += kl_criterion(mu, logvar, batch_size = self.batch_size)
+
+        beta = torch.tensor(self.kl_annealing.get_beta()).to(self.args.device)
+        loss = reconstruction_loss + beta * kl_loss
+        
+        self.optim.zero_grad()
+        loss.backward()
+        self.optimizer_step()
+
+        return loss
     
     def val_one_step(self, img, label):
         # TODO
-        raise NotImplementedError
+        img = img.permute(1, 0, 2, 3, 4)
+        label = label.permute(1, 0, 2, 3, 4)
+        decoded_frame_list = [img[0].cpu()]
+        out = img[0]
+        PSNR = 0.0
+        PSNR_perframe = []
+        reconstruction_loss = 0.0
+        kl_loss = 0.0
+        for i in range(1, self.val_vi_len):
+            label_feat = self.label_transformation(label[i])
+            human_feat_hat = self.frame_transformation(out)
+            
+            z = torch.cuda.FloatTensor(1, self.args.N_dim, self.args.frame_H, self.args.frame_W).normal_()
+            
+            parm = self.Decoder_Fusion(human_feat_hat, label_feat, z)  
+            out = self.Generator(parm)
+            decoded_frame_list.append(out.cpu())
+            PSNR_value = Generate_PSNR(out, img[i])
+            PSNR += PSNR_value
+            PSNR_perframe.append(PSNR_value.detach().cpu())
+            reconstruction_loss += self.mse_criterion(out, img[i])
+        
+        generated_frame = stack(decoded_frame_list).permute(1, 0, 2, 3, 4)
+        self.make_gif(generated_frame[0], os.path.join(self.args.save_root, f'{self.args.kl_anneal_type}.gif'))
+        loss = reconstruction_loss
+        self.gen_image(PSNR_perframe,[], [], [], PSNR_frame = True)
+
+        return loss, PSNR
                 
     def make_gif(self, images_list, img_name):
         new_list = []
@@ -169,9 +331,20 @@ class VAE_Model(nn.Module):
         return val_loader
     
     def teacher_forcing_ratio_update(self):
-        # TODO
-        raise NotImplementedError
+
+        if self.current_epoch >= self.tfr_sde and self.tfr > 0:
+            #self.tfr *= self.tfr_d_step
+            self.tfr -= self.tfr_d_step
+        self.tfr = max(self.tfr, 0)
+    
+    def make_gif(self, images_list, img_name):
+        new_list = []
+        for img in images_list:
+            new_list.append(transforms.ToPILImage()(img))
             
+        new_list[0].save(img_name, format="GIF", append_images=new_list,
+                    save_all=True, duration=20, loop=0)
+
     def tqdm_bar(self, mode, pbar, loss, lr):
         pbar.set_description(f"({mode}) Epoch {self.current_epoch}, lr:{lr}" , refresh=False)
         pbar.set_postfix(loss=float(loss), refresh=False)
